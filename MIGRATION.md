@@ -53,7 +53,7 @@ python scripts/ui_smoke.py --base https://rootrise-funding-readiness.onrender.co
 ## 4. Hunter (`rootrise-opportunity-hunter`, branch `fix/hunter-contract`)
 
 1. Merge the Hunter PR. (It works against both v1.1 and v4 dashboards: older backends ignore the extra fields.)
-2. Optional: repository **variable** `HUNTER_MODEL` (default `claude-opus-5-5`).
+2. Optional: repository **variable** `HUNTER_MODEL` (default `claude-sonnet-5-5`).
 3. Actions → *🎯 Opportunity Hunter v3.4* → **Run workflow** (`dry_run=false`).
 4. Confirm that the run is green and that new rows have `source` set (not `manual`), the correct `category`, and `needs_check` for auth-walled pages:
    ```bash
