@@ -498,6 +498,8 @@ def init_db():
         conn.commit()
         # Versioned, additive migrations (backs the DB up first when anything is pending)
         migrations.run_migrations(conn, DATABASE_PATH)
+        migrations.backfill_structured_fields(conn)   # rows written by an older build (rollback)
+        conn.commit()
         # Seed if empty (fresh installs only — never touches existing rows)
         cursor.execute("SELECT COUNT(*) FROM opportunities")
         if cursor.fetchone()[0] == 0:

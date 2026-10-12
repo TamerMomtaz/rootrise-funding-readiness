@@ -46,8 +46,17 @@ def m2_structured_opportunity_fields(conn):
     _add_column(conn, "opportunities", "needs_check", "INTEGER NOT NULL DEFAULT 0")
     _add_column(conn, "opportunities", "access_status", "TEXT")
     _add_column(conn, "opportunities", "url_normalized", "TEXT")
+    backfill_structured_fields(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_category ON opportunities(category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_url_norm ON opportunities(url_normalized)")
 
-    # Backfill only rows that have never been backfilled (category IS NULL).
+
+def backfill_structured_fields(conn) -> int:
+    """Fill category/source/needs_check/access_status/url_normalized for rows that have
+    none yet (category IS NULL). Runs inside m2 and on every boot, so rows written by an
+    older build after a rollback are picked up on re-upgrade. Never touches filled rows."""
+    if "category" not in _columns(conn, "opportunities"):
+        return 0
     rows = conn.execute(
         "SELECT id, type, notes, url FROM opportunities WHERE category IS NULL"
     ).fetchall()
@@ -68,9 +77,8 @@ def m2_structured_opportunity_fields(conn):
             ),
         )
     if rows:
-        log.info("migration: backfilled category/source/needs_check for %d rows", len(rows))
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_category ON opportunities(category)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_opp_url_norm ON opportunities(url_normalized)")
+        log.info("backfilled category/source/needs_check for %d rows", len(rows))
+    return len(rows)
 
 
 MIGRATIONS = [

@@ -81,3 +81,15 @@ def test_build_db_from_export_roundtrip(tmp_path, monkeypatch):
     build(str(src), str(tmp_path / "restored.db"))
     opps, _ = boot(monkeypatch, str(tmp_path / "restored.db"))
     assert [o["id"] for o in opps] == [7]
+
+
+def test_rows_written_by_old_build_after_rollback_are_backfilled(monkeypatch, v32_db):
+    boot(monkeypatch, v32_db)
+    conn = sqlite3.connect(v32_db)      # simulate v1.1 code inserting after a rollback
+    conn.execute("""INSERT INTO opportunities (name, type, status, notes, url, created_at, updated_at)
+                    VALUES ('Old build row', 'government', 'researching',
+                            '[📋 BD | 🔒 NEEDS CHECK | Auto: ICTworks] x', 'https://o.example', '2026-10-01T00:00:00', '2026-10-01T00:00:00')""")
+    conn.commit(); conn.close()
+    opps, _ = boot(monkeypatch, v32_db)
+    row = next(o for o in opps if o["name"] == "Old build row")
+    assert (row["category"], row["source"], row["needs_check"]) == ("bd", "ICTworks", True)
