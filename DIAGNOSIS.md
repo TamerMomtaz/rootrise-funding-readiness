@@ -53,7 +53,7 @@ Severity key: **P0** broken / data loss · **P1** wrong results or security expo
 
 ### P1-3 · Writes are completely open; `API_KEY` is never checked. ✅ Verified
 - **Evidence:** `main.py:29` defines `API_KEY` with a public default (`rootrise-dev-key-2024`, also printed in `env.example`). No dependency reads it. Anyone can POST, PUT or DELETE.
-- **Fix:** see the **Auth proposal** at the end of this report. It is implemented behind `AUTH_MODE`, so nothing changes until you set the env vars.
+- **Fix:** see **Auth** at the end of this report. It is implemented behind `AUTH_MODE` (default `off`), so nothing changes until you set the env vars.
 
 ### P1-4 · CORS is `*` combined with `allow_credentials=True`. ✅ Verified
 - **Evidence:** `main.py:352-358`. A live response to `Origin: https://evil.example` carries `access-control-allow-origin: *` and `access-control-allow-credentials: true`. Browsers refuse that combination for credentialed requests, so it is misconfigured as well as over-broad.
@@ -127,7 +127,11 @@ Severity key: **P0** broken / data loss · **P1** wrong results or security expo
 
 ---
 
-## Auth proposal (needs your approval before it is switched on)
+## Auth: proposal and decision
+
+**Decision (2026-10-12):** option 1 with reads gated too. There are three modes: `AUTH_MODE=off` (default), `writes` and `full`. In `full`, everything under `/api` except `/api/health` and `/api/auth/*` needs credentials, and the Hunter's `X-API-Key` works for reads as well as writes. Implemented in `backend/auth.py`; rollout steps are in MIGRATION.md §6.
+
+### Original proposal
 
 | Caller | Mechanism |
 |---|---|
