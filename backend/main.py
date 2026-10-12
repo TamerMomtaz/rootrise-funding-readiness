@@ -1141,6 +1141,13 @@ async def health_check():
             "timestamp": now_iso()}
 
 
+@app.get("/sw.js", include_in_schema=False)
+async def service_worker():
+    """Served from the root so its scope covers the whole app (PWA installability)."""
+    path = os.path.join(os.path.dirname(__file__), "..", "frontend", "sw.js")
+    return FileResponse(path, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
+
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
