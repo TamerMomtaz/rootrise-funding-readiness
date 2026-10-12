@@ -54,6 +54,11 @@ def _secret() -> bytes:
     return secret.encode()
 
 
+def _same(a: str, b: str) -> bool:
+    """Constant-time compare that never raises (compare_digest rejects non-ASCII str)."""
+    return hmac.compare_digest(a.encode("utf-8", "surrogateescape"), b.encode("utf-8", "surrogateescape"))
+
+
 def _b64(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
@@ -75,7 +80,7 @@ def verify_token(token: str) -> bool:
     try:
         body, sig = token.split(".", 1)
         expected = _b64(hmac.new(_secret(), body.encode(), hashlib.sha256).digest())
-        if not hmac.compare_digest(sig, expected):
+        if not _same(sig, expected):
             return False
         return json.loads(_unb64(body)).get("exp", 0) > time.time()
     except Exception:
@@ -85,7 +90,7 @@ def verify_token(token: str) -> bool:
 def is_authenticated(headers) -> bool:
     key = _api_key()
     sent_key = headers.get("x-api-key")
-    if key and sent_key and hmac.compare_digest(sent_key, key):
+    if key and sent_key and _same(sent_key, key):
         return True
     auth = headers.get("authorization", "")
     if auth.lower().startswith("bearer ") and _passcode():
@@ -124,7 +129,7 @@ def record_failure(ip: str):
 
 def check_passcode(passcode: str) -> bool:
     expected = _passcode()
-    return bool(expected and passcode and hmac.compare_digest(passcode, expected))
+    return bool(expected and passcode and _same(passcode, expected))
 
 
 def startup_warnings():

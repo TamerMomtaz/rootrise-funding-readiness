@@ -81,3 +81,11 @@ def test_cors_is_not_wildcard(client):
     r = client.get("/api/health", headers={"Origin": "https://rootrise-funding-readiness.onrender.com"})
     assert r.headers.get("access-control-allow-origin") == "https://rootrise-funding-readiness.onrender.com"
     assert r.headers.get("access-control-allow-credentials") is None
+
+
+def test_non_ascii_credentials_are_401_not_500(client, secured, monkeypatch):
+    monkeypatch.setenv("AUTH_MODE", "full")
+    assert client.post("/api/auth/login", json={"passcode": "pässwörd ✓"}).status_code == 401
+    r = client.get("/api/opportunities", headers={"X-API-Key": "k\u00e9y".encode("latin-1"),
+                                                  "Authorization": "Bearer \u00e9.\u00e9".encode("latin-1")})
+    assert r.status_code == 401
