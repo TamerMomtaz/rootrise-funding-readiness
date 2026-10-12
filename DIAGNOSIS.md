@@ -59,7 +59,7 @@ Severity key: **P0** broken / data loss · **P1** wrong results or security expo
 - **Evidence:** `main.py:352-358`. A live response to `Origin: https://evil.example` carries `access-control-allow-origin: *` and `access-control-allow-credentials: true`. Browsers refuse that combination for credentialed requests, so it is misconfigured as well as over-broad.
 - **Fix:** an allowlist from `CORS_ORIGINS` (default: the Render origin plus localhost), `allow_credentials=False`, and only the methods and headers the app needs.
 
-### P1-5 · Upcoming-deadline count is 0, and 15 expired opportunities still count as "active". ✅ Verified
+### P1-5 · All 26 expired opportunities still count as "active". ✅ Verified
 - **Evidence:** live stats show `upcoming_deadlines: 0` and `active_opportunities: 125`. **All 26** rows that have a deadline are past it (the latest is TiE Women MENA, 2026-06-25; others include Techstars Boston 2025-06-11 and Google MENA 2026-01-30), and all 26 are still `researching`/`preparing`. "0 upcoming" is correct; "125 active" is not. The UI's "Priority Opportunities" shows "EBRD … 180d overdue" as the top card.
 - **Fix:** a computed `is_expired` (past deadline while still pre-submission) on every row. Active, upcoming, top-priority and default list views exclude expired rows, and there is an **Expired** archive view. No row is modified.
 
