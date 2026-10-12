@@ -28,6 +28,10 @@ from contextlib import contextmanager, asynccontextmanager
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "funding_readiness.db")
 API_KEY = os.environ.get("API_KEY", "rootrise-dev-key-2024")
 APP_VERSION = "4.0.0"
+CORS_ORIGINS = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS",
+    "https://rootrise-funding-readiness.onrender.com,http://localhost:8000,http://127.0.0.1:8000",
+).split(",") if o.strip()]
 
 
 def utcnow() -> datetime:
@@ -81,6 +85,15 @@ class ReadinessCategory(str, Enum):
     MARKET = "market"
     OPERATIONS = "operations"
     DOCUMENTATION = "documentation"
+
+# Whitelisted ORDER BY clauses. NULLs always sort last so rolling programs
+# (no deadline) don't crowd the top of a deadline-ascending list.
+def _order(col: str):
+    return {"asc": f"({col} IS NULL OR {col} = '') ASC, {col} ASC, id ASC",
+            "desc": f"({col} IS NULL OR {col} = '') ASC, {col} DESC, id DESC"}
+
+OPPORTUNITY_SORTS = {k: _order(k) for k in ("deadline", "fit_score", "priority", "created_at", "updated_at", "name")}
+READINESS_SORTS = {k: _order(k) for k in ("due_date", "priority", "status", "created_at", "category", "name")}
 
 # Pipeline type groupings
 STARTUP_TYPES = ['accelerator', 'grant', 'vc_fund', 'angel', 'corporate',
@@ -183,8 +196,12 @@ class DashboardStats(BaseModel):
 # ============================================
 
 def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
+    # WAL lets readers proceed while the Hunter writes; busy_timeout waits instead of
+    # failing with "database is locked". Run a single uvicorn worker (see start.sh).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 @contextmanager
@@ -368,10 +385,11 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    expose_headers=["X-Duplicate-Of"],
 )
 
 static_dir = os.path.join(os.path.dirname(__file__), "..", "frontend", "static")
@@ -389,7 +407,7 @@ async def get_opportunities(
     min_fit_score: Optional[int] = Query(None, ge=0, le=100),
     pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$"),
     is_saved: Optional[bool] = None,
-    sort_by: str = Query("deadline", pattern="^(deadline|fit_score|priority|created_at)$"),
+    sort_by: str = Query("deadline", pattern="^(deadline|fit_score|priority|created_at|updated_at|name)$"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$")
 ):
     """Get all funding opportunities with optional filters including pipeline and saved"""
@@ -403,7 +421,7 @@ async def get_opportunities(
         if type:
             query += " AND type = ?"
             params.append(type.value)
-        if min_fit_score:
+        if min_fit_score is not None:
             query += " AND fit_score >= ?"
             params.append(min_fit_score)
         if is_saved is not None:
@@ -417,7 +435,7 @@ async def get_opportunities(
             placeholders = ','.join('?' * len(BD_TYPES))
             query += f" AND type IN ({placeholders})"
             params.extend(BD_TYPES)
-        query += f" ORDER BY {sort_by} {sort_order.upper()}"
+        query += " ORDER BY " + OPPORTUNITY_SORTS[sort_by][sort_order]
         cursor.execute(query, params)
         return [clean_row(row) for row in cursor.fetchall()]
 
@@ -550,7 +568,7 @@ async def get_readiness_items(
     status: Optional[ReadinessStatus] = None,
     category: Optional[ReadinessCategory] = None,
     owner: Optional[str] = None,
-    sort_by: str = Query("priority", pattern="^(due_date|priority|status|created_at|category)$"),
+    sort_by: str = Query("priority", pattern="^(due_date|priority|status|created_at|category|name)$"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$")
 ):
     with db_session() as conn:
@@ -566,7 +584,7 @@ async def get_readiness_items(
         if owner:
             query += " AND owner = ?"
             params.append(owner)
-        query += f" ORDER BY {sort_by} {sort_order.upper()}"
+        query += " ORDER BY " + READINESS_SORTS[sort_by][sort_order]
         cursor.execute(query, params)
         return [clean_row(row) for row in cursor.fetchall()]
 
@@ -706,13 +724,6 @@ async def get_activity_log(limit: int = Query(20, ge=1, le=100)):
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy", "version": APP_VERSION, "timestamp": now_iso()}
-
-@app.post("/api/reset-database")
-async def reset_database():
-    if os.path.exists(DATABASE_PATH):
-        os.remove(DATABASE_PATH)
-    init_db()
-    return {"message": "Database reset to initial state"}
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
