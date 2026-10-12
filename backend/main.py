@@ -14,10 +14,10 @@ v1.1 — Feb 13, 2026:
   + Counts by Type endpoint (for filter tabs with dynamic counts)
 """
 
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Literal
 from datetime import datetime, timedelta, timezone
@@ -31,11 +31,12 @@ from contextlib import contextmanager, asynccontextmanager
 try:
     from .normalize import (to_utc, iso_utc, normalize_url, parse_notes_tags, category_for_type,
                             is_duplicate, STARTUP_TYPES, BD_TYPES)
-    from . import migrations
+    from . import migrations, auth
 except ImportError:  # running as `uvicorn main:app` from backend/
     from normalize import (to_utc, iso_utc, normalize_url, parse_notes_tags, category_for_type,
                            is_duplicate, STARTUP_TYPES, BD_TYPES)
     import migrations
+    import auth
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -46,7 +47,7 @@ log = logging.getLogger("frd")
 # ============================================
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "funding_readiness.db")
-API_KEY = os.environ.get("API_KEY", "rootrise-dev-key-2024")
+# API_KEY / TEAM_PASSCODE / AUTH_SECRET / AUTH_MODE are read by auth.py
 APP_VERSION = "4.0.0"
 CORS_ORIGINS = [o.strip() for o in os.environ.get(
     "CORS_ORIGINS",
@@ -622,6 +623,7 @@ def reconcile_readiness(status: str, pct: int, status_set: bool, pct_set: bool):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    auth.startup_warnings()
     yield
 
 
@@ -631,6 +633,16 @@ app = FastAPI(
     version=APP_VERSION,
     lifespan=lifespan,
 )
+
+@app.middleware("http")
+async def require_credentials(request: Request, call_next):
+    """AUTH_MODE gate (see auth.py). Registered before CORS so CORS stays outermost
+    and 401s still carry CORS headers."""
+    if auth.requires_auth(request.method, request.url.path) and not auth.is_authenticated(request.headers):
+        return JSONResponse({"detail": "Authentication required", "auth_mode": auth.mode()},
+                            status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -644,6 +656,30 @@ app.add_middleware(
 static_dir = os.path.join(os.path.dirname(__file__), "..", "frontend", "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# ============================================
+# Auth Endpoints
+# ============================================
+
+class LoginRequest(BaseModel):
+    passcode: str = Field(..., min_length=1, max_length=200)
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    return {"mode": auth.mode(), "authenticated": auth.is_authenticated(request.headers),
+            "passcode_configured": bool(os.environ.get("TEAM_PASSCODE"))}
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    if not auth.login_allowed(ip):
+        raise HTTPException(status_code=429, detail="Too many attempts — try again in 10 minutes")
+    if not auth.check_passcode(body.passcode):
+        auth.record_failure(ip)
+        raise HTTPException(status_code=401, detail="Wrong passcode")
+    return {**auth.issue_token(), "mode": auth.mode()}
 
 # ============================================
 # Opportunity Endpoints
