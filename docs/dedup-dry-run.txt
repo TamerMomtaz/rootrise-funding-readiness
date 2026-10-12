@@ -1,0 +1,30 @@
+125 opportunities · 5 duplicate groups · 12 rows would be removed
+MODE: DRY RUN (no changes)
+
+KEEP  #11   Flat6Labs MENA Accelerator  [accelerator, researching]
+  DROP #65   Flat6Labs MENA Accelerator Program  (canonical_name)  https://flat6labs.com/flat6labs-celebrates-achievements-of-3-year-startmashreq-program-across-jordan-lebanon-and-iraq/
+  FILL {'notes': '[🚀 STARTUP | Auto: Flat6Labs] Perfect fit - leading MENA acc…'}
+
+KEEP  #41   Microsoft for Startups Founders Hub  [cloud_credits, researching]
+  DROP #50   Microsoft for Startups Founders Hub  (canonical_name)  https://startups.microsoft.com/founders-hub
+  DROP #52   Microsoft for Startups Founders Hub  (canonical_name)  https://startups.microsoft.com/en-us/founders-hub/
+  FILL {'notes': '[🚀 STARTUP | Auto: Known:Microsoft] Excellent fit - substant…'}
+
+KEEP  #44   Google for Startups Accelerator MENAT 2026  [accelerator, researching]
+  DROP #45   Google for Startups Accelerator MENAT 2026  (canonical_name)  https://www.opportunitiesforafricans.com/google-for-startups-accelerator-middle-east-north-africa-program-2026/
+  DROP #46   Google for Startups Accelerator MENA 2026  (fuzzy_name)  https://thestartupscene.me/OPPORTUNITIES/Google-Opens-Applications-for-Its-2026-MENA-Startup-Accelerator
+  DROP #47   Google for Startups Accelerator MENA & Turkey 2026  (fuzzy_name)  https://www.scholarshiplit.com/google-for-startups-accelerator-mena-turkey-2026-1
+  DROP #49   Google 2026 Startups Accelerator MENA & Turkey  (transitive)  https://www.linkedin.com/posts/menastartupdigest_apply-now-for-googles-2026-startups-accelerator-activity-7409156035271323649-8sRV
+  FILL {'fit_score': 95, 'priority': 1, 'notes': '[🚀 STARTUP | Auto: WebSearch] Excellent fit - MENA-focused, …'}
+
+KEEP  #3    EBRD Star Venture (Cohort 5)  [accelerator, researching]
+  DROP #84   EBRD Star Venture  (canonical_name)  https://www.ebrd.com/home/what-we-do/products-and-services/support-for-start-ups-and-msmes/our-programmes/star-venture/Start-up-applications.html
+  FILL {'notes': '18-month program, no equity. Primary target for RootRise.\n[m…'}
+
+KEEP  #9    TechCrunch Startup Battlefield 200  [competition, researching]
+  DROP #86   TechCrunch Startup Battlefield 200  (canonical_name)  https://techcrunch.com/2026/05/07/startup-battlefield-200-applications-close-may-27-a-shot-at-vc-access-global-visibility-techcrunch-coverage-and-100k/
+  DROP #96   TechCrunch Startup Battlefield 200  (canonical_name)  https://techcrunch.com/2026/05/14/two-weeks-left-startup-battlefield-200-applications-close-may-27/
+  DROP #110  TechCrunch Startup Battlefield 200  (canonical_name)  https://techcrunch.com/2026/05/25/startup-battlefield-200-applications-close-in-days-apply-before-may-27/
+  DROP #114  TechCrunch Startup Battlefield 200  (canonical_name)  https://techcrunch.com/2026/05/28/startup-battlefield-200-application-deadline-extended-to-june-8-after-overwhelming-demand/
+  FILL {'priority': 1, 'notes': '[🚀 STARTUP | Auto: TechCrunch] Major startup competition wit…'}
+
