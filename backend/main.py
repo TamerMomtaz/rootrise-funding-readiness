@@ -12,14 +12,14 @@ from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 from typing import Optional, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import sqlite3
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 
 # ============================================
 # Configuration
@@ -27,6 +27,16 @@ from contextlib import contextmanager
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "funding_readiness.db")
 API_KEY = os.environ.get("API_KEY", "rootrise-dev-key-2024")
+APP_VERSION = "4.0.0"
+
+
+def utcnow() -> datetime:
+    """Timezone-aware current UTC time (replaces deprecated datetime.utcnow())."""
+    return datetime.now(timezone.utc)
+
+
+def now_iso() -> str:
+    return utcnow().replace(microsecond=0).isoformat()
 
 # ============================================
 # Enums
@@ -271,7 +281,7 @@ def init_db():
 
 def seed_initial_data(cursor):
     """Seed database with initial RootRise funding opportunities and readiness items"""
-    now = datetime.utcnow().isoformat()
+    now = now_iso()
     opportunities = [
         ("Google for Startups MENA", "accelerator", "2026-01-30T00:00:00", "preparing", 80,
          "https://startup.google.com/programs/accelerator/middle-east-north-africa-turkey/",
@@ -337,16 +347,23 @@ def log_activity(cursor, action: str, entity_type: str, entity_id: int, details:
     cursor.execute("""
         INSERT INTO activity_log (action, entity_type, entity_id, details, timestamp)
         VALUES (?, ?, ?, ?, ?)
-    """, (action, entity_type, entity_id, details, datetime.utcnow().isoformat()))
+    """, (action, entity_type, entity_id, details, now_iso()))
 
 # ============================================
 # FastAPI Application
 # ============================================
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="RootRise Funding Readiness API",
     description="API for tracking funding opportunities and readiness for DEVONEERS/RootRise",
-    version="1.1.0"
+    version=APP_VERSION,
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -357,14 +374,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-import os as os_module
-static_dir = os_module.path.join(os_module.path.dirname(__file__), "..", "frontend", "static")
-if os_module.path.exists(static_dir):
+static_dir = os.path.join(os.path.dirname(__file__), "..", "frontend", "static")
+if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-@app.on_event("startup")
-async def startup_event():
-    init_db()
 
 # ============================================
 # Opportunity Endpoints
@@ -375,10 +387,10 @@ async def get_opportunities(
     status: Optional[OpportunityStatus] = None,
     type: Optional[OpportunityType] = None,
     min_fit_score: Optional[int] = Query(None, ge=0, le=100),
-    pipeline: Optional[str] = Query(None, regex="^(startup|bd)$"),
+    pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$"),
     is_saved: Optional[bool] = None,
-    sort_by: str = Query("deadline", regex="^(deadline|fit_score|priority|created_at)$"),
-    sort_order: str = Query("asc", regex="^(asc|desc)$")
+    sort_by: str = Query("deadline", pattern="^(deadline|fit_score|priority|created_at)$"),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$")
 ):
     """Get all funding opportunities with optional filters including pipeline and saved"""
     with db_session() as conn:
@@ -410,7 +422,7 @@ async def get_opportunities(
         return [clean_row(row) for row in cursor.fetchall()]
 
 @app.get("/api/opportunities/counts-by-type")
-async def get_opportunity_counts_by_type(pipeline: Optional[str] = Query(None, regex="^(startup|bd)$")):
+async def get_opportunity_counts_by_type(pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$")):
     """Return opportunity counts grouped by type for filter tabs with dynamic counts."""
     with db_session() as conn:
         cursor = conn.cursor()
@@ -453,7 +465,7 @@ async def toggle_save_opportunity(opp_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         new_state = 0 if row[0] else 1
-        now = datetime.utcnow().isoformat()
+        now = now_iso()
         cursor.execute("UPDATE opportunities SET is_saved = ?, updated_at = ? WHERE id = ?", (new_state, now, opp_id))
         log_activity(cursor, "saved" if new_state else "unsaved", "opportunity", opp_id, f"{'Saved' if new_state else 'Unsaved'}: {row[1]}")
         return {"id": opp_id, "is_saved": bool(new_state), "message": f"Opportunity {'saved' if new_state else 'unsaved'}"}
@@ -470,7 +482,7 @@ async def get_opportunity(opp_id: int):
 
 @app.post("/api/opportunities", response_model=Opportunity)
 async def create_opportunity(opp: OpportunityCreate):
-    now = datetime.utcnow().isoformat()
+    now = now_iso()
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -499,7 +511,7 @@ async def update_opportunity(opp_id: int, opp: OpportunityUpdate):
             raise HTTPException(status_code=404, detail="Opportunity not found")
         update_fields = []
         params = []
-        update_data = opp.dict(exclude_unset=True)
+        update_data = opp.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             if value is not None:
                 if field == "deadline" and value:
@@ -510,7 +522,7 @@ async def update_opportunity(opp_id: int, opp: OpportunityUpdate):
                 params.append(value)
         if update_fields:
             update_fields.append("updated_at = ?")
-            params.append(datetime.utcnow().isoformat())
+            params.append(now_iso())
             params.append(opp_id)
             cursor.execute(f"UPDATE opportunities SET {', '.join(update_fields)} WHERE id = ?", params)
             log_activity(cursor, "updated", "opportunity", opp_id, f"Updated fields: {', '.join(update_data.keys())}")
@@ -538,8 +550,8 @@ async def get_readiness_items(
     status: Optional[ReadinessStatus] = None,
     category: Optional[ReadinessCategory] = None,
     owner: Optional[str] = None,
-    sort_by: str = Query("priority", regex="^(due_date|priority|status|created_at|category)$"),
-    sort_order: str = Query("asc", regex="^(asc|desc)$")
+    sort_by: str = Query("priority", pattern="^(due_date|priority|status|created_at|category)$"),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$")
 ):
     with db_session() as conn:
         cursor = conn.cursor()
@@ -570,7 +582,7 @@ async def get_readiness_item(item_id: int):
 
 @app.post("/api/readiness-items", response_model=ReadinessItem)
 async def create_readiness_item(item: ReadinessItemCreate):
-    now = datetime.utcnow().isoformat()
+    now = now_iso()
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -598,7 +610,7 @@ async def update_readiness_item(item_id: int, item: ReadinessItemUpdate):
             raise HTTPException(status_code=404, detail="Readiness item not found")
         update_fields = []
         params = []
-        update_data = item.dict(exclude_unset=True)
+        update_data = item.model_dump(exclude_unset=True)
         for field, value in update_data.items():
             if value is not None:
                 if field == "due_date" and value:
@@ -617,7 +629,7 @@ async def update_readiness_item(item_id: int, item: ReadinessItemUpdate):
                 params.append("in_progress")
         if update_fields:
             update_fields.append("updated_at = ?")
-            params.append(datetime.utcnow().isoformat())
+            params.append(now_iso())
             params.append(item_id)
             cursor.execute(f"UPDATE readiness_items SET {', '.join(update_fields)} WHERE id = ?", params)
             log_activity(cursor, "updated", "readiness_item", item_id, f"Updated fields: {', '.join(update_data.keys())}")
@@ -648,12 +660,12 @@ async def get_dashboard_stats():
         total_opps = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM opportunities WHERE status NOT IN ('rejected', 'closed')")
         active_opps = cursor.fetchone()[0]
-        thirty_days = (datetime.utcnow() + timedelta(days=30)).isoformat()
+        thirty_days = (utcnow() + timedelta(days=30)).isoformat()
         cursor.execute("""
             SELECT COUNT(*) FROM opportunities
             WHERE deadline IS NOT NULL AND deadline != '' AND deadline <= ? AND deadline >= ?
             AND status NOT IN ('submitted', 'accepted', 'rejected', 'closed')
-        """, (thirty_days, datetime.utcnow().isoformat()))
+        """, (thirty_days, now_iso()))
         upcoming_deadlines = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(*) FROM readiness_items")
         total_items = cursor.fetchone()[0]
@@ -670,7 +682,7 @@ async def get_dashboard_stats():
         opps_by_type = {r["type"]: r["count"] for r in cursor.fetchall()}
         cursor.execute("SELECT category, AVG(completion_percentage) as avg_completion, COUNT(*) as total, SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) as completed FROM readiness_items GROUP BY category")
         readiness_by_cat = {r["category"]: {"avg_completion": round(r["avg_completion"], 1), "total": r["total"], "completed": r["completed"]} for r in cursor.fetchall()}
-        seven_days = (datetime.utcnow() + timedelta(days=7)).isoformat()
+        seven_days = (utcnow() + timedelta(days=7)).isoformat()
         cursor.execute("SELECT * FROM readiness_items WHERE due_date IS NOT NULL AND due_date != '' AND due_date <= ? AND status != 'complete' ORDER BY due_date ASC LIMIT 10", (seven_days,))
         urgent_items = [clean_row(r) for r in cursor.fetchall()]
         cursor.execute("SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 10")
@@ -693,7 +705,7 @@ async def get_activity_log(limit: int = Query(20, ge=1, le=100)):
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "version": "1.1.0", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "version": APP_VERSION, "timestamp": now_iso()}
 
 @app.post("/api/reset-database")
 async def reset_database():
@@ -706,7 +718,7 @@ async def reset_database():
 async def serve_frontend():
     frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "index.html")
     if os.path.exists(frontend_path):
-        with open(frontend_path, "r") as f:
+        with open(frontend_path, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
     return HTMLResponse(content="<h1>Frontend not found. Please build the frontend.</h1>")
 
