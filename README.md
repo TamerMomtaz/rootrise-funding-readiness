@@ -35,7 +35,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 DATABASE_PATH=./data/frd.db uvicorn backend.main:app --reload --port 8000   # mkdir data first
 open http://localhost:8000
-python -m pytest                       # 63 tests, temp DBs, ~2 s
+python -m pytest                       # 64 tests, temp DBs, ~2 s
 ```
 A fresh DB is seeded with demo rows whose dates are relative to today. Seeds never run on a DB that already has data.
 

@@ -28,7 +28,7 @@ The overhaul release: it makes the dashboard correct again, catches it up with H
 - Readiness category `technical`; alias `pitch_materials` maps to `pitch`.
 - Versioned, additive migrations (`PRAGMA user_version`) with an automatic `.bak` copy of the DB before any pending migration.
 - Scripts: `backup_via_api.py`, `build_db_from_export.py`, `merge_duplicates.py`, `ui_smoke.py` and `hunter_e2e.py`.
-- `tests/`: 63 pytest tests, plus a GitHub Actions workflow.
+- `tests/`: 64 pytest tests, plus a GitHub Actions workflow.
 
 ### Frontend (rewritten)
 - DEVONEERS design system (Inter; navy, gold and cream); RootRise identity and tagline kept.
