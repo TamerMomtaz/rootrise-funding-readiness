@@ -11,7 +11,7 @@ Live snapshot used as evidence (read-only, saved as a JSON backup before any wor
 | `GET /api/opportunities` | 125 rows, ids 1–125, newest `created_at` **2026-06-15** |
 | `GET /api/readiness-items` | 17 rows (the Jan-2026 seed set, untouched since) |
 | `GET /api/activity-log?limit=100` | 99 `created`, 1 `updated`; newest entry 2026-08-08 |
-| `GET /api/dashboard-stats` | `upcoming_deadlines: 0`, `active_opportunities: 125` (includes 15 long-expired rows) |
+| `GET /api/dashboard-stats` | `upcoming_deadlines: 0`, `active_opportunities: 125` (includes all 26 expired rows) |
 
 Severity key: **P0** broken / data loss · **P1** wrong results or security exposure · **P2** robustness / tech debt / missing scoped features · **P3** cosmetic.
 "✅ Verified" = reproduced with evidence; "❎ Not reproduced" = suspected issue that turned out not to exist as described.
@@ -60,7 +60,7 @@ Severity key: **P0** broken / data loss · **P1** wrong results or security expo
 - **Fix:** an allowlist from `CORS_ORIGINS` (default: the Render origin plus localhost), `allow_credentials=False`, and only the methods and headers the app needs.
 
 ### P1-5 · Upcoming-deadline count is 0, and 15 expired opportunities still count as "active". ✅ Verified
-- **Evidence:** live stats show `upcoming_deadlines: 0` and `active_opportunities: 125`. 15 rows have deadlines before 2026-10-12 (for example Techstars Boston 2025-06-11, Google MENA 2026-01-30, TiE Women MENA 2026-06-25), and all 15 are `researching`/`preparing`. The UI's "Priority Opportunities" shows "EBRD … 180d overdue" as the top card.
+- **Evidence:** live stats show `upcoming_deadlines: 0` and `active_opportunities: 125`. **All 26** rows that have a deadline are past it (the latest is TiE Women MENA, 2026-06-25; others include Techstars Boston 2025-06-11 and Google MENA 2026-01-30), and all 26 are still `researching`/`preparing`. "0 upcoming" is correct; "125 active" is not. The UI's "Priority Opportunities" shows "EBRD … 180d overdue" as the top card.
 - **Fix:** a computed `is_expired` (past deadline while still pre-submission) on every row. Active, upcoming, top-priority and default list views exclude expired rows, and there is an **Expired** archive view. No row is modified.
 
 ### P1-6 · `sort_by=deadline asc` puts NULL deadlines first. ✅ Verified

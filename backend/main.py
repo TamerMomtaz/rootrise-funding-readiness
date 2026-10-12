@@ -2,24 +2,44 @@
 RootRise Funding Readiness System - Backend API
 FastAPI application with SQLite database for tracking funding opportunities and readiness items
 
+v4.0 — Oct 2026 (see CHANGELOG.md):
+  + Structured opportunity fields (category, source, needs_check, access_status, url_normalized)
+    with a versioned, additive migration that backfills them from the Hunter's notes tags
+  + Lenient Hunter contract: unknown type/status, free-text deadlines and out-of-range
+    scores are coerced and logged instead of rejected with 422
+  + UTC-aware datetimes, explicit nulls clear fields, computed is_expired / days_left
+  + Readiness status <-> completion % kept consistent; documented weighted score
 v1.1 — Feb 13, 2026:
   + Saved/Starred Opportunities (toggle-save, saved filter, sidebar count)
   + Counts by Type endpoint (for filter tabs with dynamic counts)
-  + is_saved column migration (idempotent)
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel, Field
-from typing import Optional, List
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional, List, Literal
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import logging
+import math
 import sqlite3
-import json
 import os
 from contextlib import contextmanager, asynccontextmanager
+
+try:
+    from .normalize import (to_utc, iso_utc, normalize_url, parse_notes_tags, category_for_type,
+                            STARTUP_TYPES, BD_TYPES)
+    from . import migrations
+except ImportError:  # running as `uvicorn main:app` from backend/
+    from normalize import (to_utc, iso_utc, normalize_url, parse_notes_tags, category_for_type,
+                           STARTUP_TYPES, BD_TYPES)
+    import migrations
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("frd")
 
 # ============================================
 # Configuration
@@ -43,16 +63,16 @@ def now_iso() -> str:
     return utcnow().replace(microsecond=0).isoformat()
 
 # ============================================
-# Enums
+# Enums  (stored values are canonical; aliases below are accepted on input)
 # ============================================
 
 class OpportunityStatus(str, Enum):
     RESEARCHING = "researching"
     PREPARING = "preparing"
-    SUBMITTED = "submitted"
-    IN_REVIEW = "in_review"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
+    SUBMITTED = "submitted"      # UI label: Applied
+    IN_REVIEW = "in_review"      # UI label: Interview
+    ACCEPTED = "accepted"        # UI label: Won
+    REJECTED = "rejected"        # UI label: Lost
     CLOSED = "closed"
 
 class OpportunityType(str, Enum):
@@ -80,11 +100,66 @@ class ReadinessCategory(str, Enum):
     LEGAL = "legal"
     FINANCIAL = "financial"
     PITCH = "pitch"
+    TECHNICAL = "technical"
     TEAM = "team"
     PRODUCT = "product"
     MARKET = "market"
     OPERATIONS = "operations"
     DOCUMENTATION = "documentation"
+
+Category = Literal["startup", "bd"]
+
+OPP_TYPE_ALIASES = {
+    "vc": "vc_fund", "venture_capital": "vc_fund", "fund": "vc_fund", "investor": "vc_fund",
+    "cloud": "cloud_credits", "credits": "cloud_credits", "cloud_credit": "cloud_credits",
+    "incubator": "accelerator", "program": "accelerator", "programme": "accelerator",
+    "fellowship": "grant", "funding": "grant",
+    "challenge": "competition", "prize": "competition", "contest": "competition", "pitch_competition": "competition",
+    "tor": "consulting", "consultancy": "consulting",
+    "rfq": "procurement", "rfi": "rfp", "eoi": "rfp", "bid": "tender",
+}
+OPP_STATUS_ALIASES = {
+    "applied": "submitted", "interview": "in_review", "under_review": "in_review",
+    "won": "accepted", "lost": "rejected", "declined": "rejected",
+    "new": "researching", "open": "researching", "expired": "closed",
+}
+READINESS_CATEGORY_ALIASES = {"pitch_materials": "pitch", "pitch_deck": "pitch", "tech": "technical",
+                              "finance": "financial", "docs": "documentation", "ops": "operations"}
+READINESS_STATUS_ALIASES = {"done": "complete", "completed": "complete", "todo": "not_started",
+                            "to_do": "not_started", "doing": "in_progress", "wip": "in_progress"}
+
+PRE_SUBMISSION = ("researching", "preparing")
+
+
+def _key(value) -> str:
+    return str(value).strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def coerce_choice(value, enum_cls, aliases: dict, default: str, field: str):
+    """Map aliases / unknown values to a valid enum value, logging every coercion."""
+    if value is None or isinstance(value, enum_cls):
+        return value
+    k = _key(value)
+    allowed = {e.value for e in enum_cls}
+    if k in allowed:
+        return k
+    if k in aliases:
+        return aliases[k]
+    log.warning("coerced unknown %s %r -> %r", field, value, default)
+    return default
+
+
+def _clamp_int(value, lo, hi, field):
+    if value is None:
+        return None
+    try:
+        n = int(round(float(value)))
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} must be a number")
+    if n < lo or n > hi:
+        log.warning("clamped %s %r into [%d, %d]", field, value, lo, hi)
+    return max(lo, min(hi, n))
+
 
 # Whitelisted ORDER BY clauses. NULLs always sort last so rolling programs
 # (no deadline) don't crowd the top of a deadline-ascending list.
@@ -95,18 +170,55 @@ def _order(col: str):
 OPPORTUNITY_SORTS = {k: _order(k) for k in ("deadline", "fit_score", "priority", "created_at", "updated_at", "name")}
 READINESS_SORTS = {k: _order(k) for k in ("due_date", "priority", "status", "created_at", "category", "name")}
 
-# Pipeline type groupings
-STARTUP_TYPES = ['accelerator', 'grant', 'vc_fund', 'angel', 'corporate',
-                 'government', 'competition', 'cloud_credits']
-BD_TYPES = ['rfp', 'tender', 'consulting', 'procurement']
-
 # ============================================
 # Pydantic Models
 # ============================================
 
-class OpportunityBase(BaseModel):
+class _OpportunityCoercion(BaseModel):
+    """Lenient input for the Hunter and the UI: never 422 on fixable values."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data):
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        if "name" in d and isinstance(d["name"], str):
+            d["name"] = d["name"].strip()
+            if len(d["name"]) > 200:
+                log.warning("truncated name %r", d["name"][:60])
+                d["name"] = d["name"][:200].rstrip()
+        if "type" in d:
+            d["type"] = coerce_choice(d["type"], OpportunityType, OPP_TYPE_ALIASES, "other", "type")
+        if "status" in d:
+            d["status"] = coerce_choice(d["status"], OpportunityStatus, OPP_STATUS_ALIASES, "researching", "status")
+        if "fit_score" in d:
+            d["fit_score"] = _clamp_int(d["fit_score"], 0, 100, "fit_score")
+        if "priority" in d:
+            d["priority"] = _clamp_int(d["priority"], 1, 5, "priority")
+        if "category" in d and d["category"] is not None:
+            k = _key(d["category"])
+            d["category"] = "bd" if k in ("bd", "business_development") else "startup" if k == "startup" else None
+        if d.get("deadline") not in (None, ""):
+            parsed = to_utc(d["deadline"])
+            if parsed is None:
+                log.warning("unparseable deadline %r -> null (kept as deadline_text)", d["deadline"])
+                raw = str(d["deadline"])
+                d["deadline_text"] = raw[:-9] if raw.endswith("T00:00:00") else raw
+            d["deadline"] = parsed
+        elif d.get("deadline") == "":
+            d["deadline"] = None
+        for k in ("url", "notes", "funding_amount", "requirements", "contact_info", "source"):
+            if isinstance(d.get(k), str) and not d[k].strip():
+                d[k] = None
+        if "is_starred" in d and "is_saved" not in d:
+            d["is_saved"] = d["is_starred"]
+        return d
+
+
+class OpportunityCreate(_OpportunityCoercion):
     name: str = Field(..., min_length=1, max_length=200)
-    type: OpportunityType
+    type: OpportunityType = OpportunityType.OTHER
     deadline: Optional[datetime] = None
     status: OpportunityStatus = OpportunityStatus.RESEARCHING
     fit_score: int = Field(default=50, ge=0, le=100)
@@ -116,11 +228,16 @@ class OpportunityBase(BaseModel):
     requirements: Optional[str] = None
     contact_info: Optional[str] = None
     priority: int = Field(default=3, ge=1, le=5)
+    # v4.0 structured fields (optional; derived from notes tags / type when absent)
+    category: Optional[Category] = None
+    source: Optional[str] = None
+    needs_check: Optional[bool] = None
+    access_status: Optional[str] = None
+    is_saved: Optional[bool] = None
+    deadline_text: Optional[str] = Field(None, description="Free-text deadline when it can't be parsed")
 
-class OpportunityCreate(OpportunityBase):
-    pass
 
-class OpportunityUpdate(BaseModel):
+class OpportunityUpdate(_OpportunityCoercion):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     type: Optional[OpportunityType] = None
     deadline: Optional[datetime] = None
@@ -132,14 +249,70 @@ class OpportunityUpdate(BaseModel):
     requirements: Optional[str] = None
     contact_info: Optional[str] = None
     priority: Optional[int] = Field(None, ge=1, le=5)
+    category: Optional[Category] = None
+    source: Optional[str] = None
+    needs_check: Optional[bool] = None
+    access_status: Optional[str] = None
+    is_saved: Optional[bool] = None
+    deadline_text: Optional[str] = None
 
-class Opportunity(OpportunityBase):
+
+class Opportunity(BaseModel):
     id: int
-    is_saved: Optional[bool] = False
+    name: str
+    type: str
+    deadline: Optional[datetime] = None
+    status: str
+    fit_score: int
+    url: Optional[str] = None
+    notes: Optional[str] = None
+    funding_amount: Optional[str] = None
+    requirements: Optional[str] = None
+    contact_info: Optional[str] = None
+    priority: int
+    category: str
+    source: Optional[str] = None
+    needs_check: bool = False
+    access_status: Optional[str] = None
+    is_saved: bool = False
+    is_starred: bool = False
+    is_expired: bool = False
+    days_left: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 
-class ReadinessItemBase(BaseModel):
+
+class _ReadinessCoercion(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data):
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        if "category" in d:
+            d["category"] = coerce_choice(d["category"], ReadinessCategory, READINESS_CATEGORY_ALIASES,
+                                          "documentation", "readiness category")
+        if "status" in d:
+            d["status"] = coerce_choice(d["status"], ReadinessStatus, READINESS_STATUS_ALIASES,
+                                        "not_started", "readiness status")
+        if "completion_percentage" in d:
+            d["completion_percentage"] = _clamp_int(d["completion_percentage"], 0, 100, "completion_percentage")
+        if "priority" in d:
+            d["priority"] = _clamp_int(d["priority"], 1, 5, "priority")
+        if d.get("due_date") == "":
+            d["due_date"] = None
+        elif d.get("due_date") is not None:
+            parsed = to_utc(d["due_date"])
+            if parsed is None:
+                raise ValueError("due_date must be an ISO date (YYYY-MM-DD)")
+            d["due_date"] = parsed
+        for k in ("owner", "description", "dependencies"):
+            if isinstance(d.get(k), str) and not d[k].strip():
+                d[k] = None
+        return d
+
+
+class ReadinessItemCreate(_ReadinessCoercion):
     name: str = Field(..., min_length=1, max_length=200)
     category: ReadinessCategory
     status: ReadinessStatus = ReadinessStatus.NOT_STARTED
@@ -150,10 +323,8 @@ class ReadinessItemBase(BaseModel):
     dependencies: Optional[str] = None
     completion_percentage: int = Field(default=0, ge=0, le=100)
 
-class ReadinessItemCreate(ReadinessItemBase):
-    pass
 
-class ReadinessItemUpdate(BaseModel):
+class ReadinessItemUpdate(_ReadinessCoercion):
     name: Optional[str] = Field(None, min_length=1, max_length=200)
     category: Optional[ReadinessCategory] = None
     status: Optional[ReadinessStatus] = None
@@ -164,30 +335,49 @@ class ReadinessItemUpdate(BaseModel):
     dependencies: Optional[str] = None
     completion_percentage: Optional[int] = Field(None, ge=0, le=100)
 
-class ReadinessItem(ReadinessItemBase):
+
+class ReadinessItem(BaseModel):
     id: int
+    name: str
+    category: str
+    status: str
+    owner: Optional[str] = None
+    due_date: Optional[datetime] = None
+    description: Optional[str] = None
+    priority: int
+    dependencies: Optional[str] = None
+    completion_percentage: int
+    is_overdue: bool = False
     created_at: datetime
     updated_at: datetime
+
 
 class ActivityLog(BaseModel):
     id: int
     action: str
     entity_type: str
     entity_id: int
-    details: Optional[str]
+    details: Optional[str] = None
     timestamp: datetime
+
 
 class DashboardStats(BaseModel):
     total_opportunities: int
     active_opportunities: int
     upcoming_deadlines: int
+    expired_opportunities: int
+    needs_check_count: int
+    starred_count: int
     total_readiness_items: int
     completed_items: int
     in_progress_items: int
     overall_readiness_score: float
+    readiness_formula: str
     opportunities_by_status: dict
     opportunities_by_type: dict
+    opportunities_by_category: dict
     readiness_by_category: dict
+    upcoming_opportunities: List[dict]
     urgent_items: List[dict]
     recent_activity: List[dict]
 
@@ -225,23 +415,38 @@ def clean_row(row) -> dict:
     for field in datetime_fields + nullable_fields:
         if field in d and d[field] == '':
             d[field] = None
-    # Normalize is_saved to boolean
-    if 'is_saved' in d:
-        d['is_saved'] = bool(d['is_saved'])
+    for field in datetime_fields:
+        if field in d and d[field] is not None:
+            d[field] = to_utc(d[field])
+    for flag in ('is_saved', 'needs_check'):
+        if flag in d:
+            d[flag] = bool(d[flag])
     return d
 
-def run_migrations(conn):
-    """Run database migrations safely (idempotent). Called on every startup."""
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(opportunities)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "is_saved" not in columns:
-        cursor.execute("ALTER TABLE opportunities ADD COLUMN is_saved BOOLEAN DEFAULT 0")
-        conn.commit()
-        print("✅ Migration: Added 'is_saved' column to opportunities table", flush=True)
+
+def opportunity_out(row, now: datetime = None) -> dict:
+    """Row -> API dict with computed fields (is_starred, is_expired, days_left)."""
+    d = clean_row(row)
+    now = now or utcnow()
+    d.pop("url_normalized", None)
+    d["category"] = d.get("category") or category_for_type(d.get("type"))
+    d["is_starred"] = d.get("is_saved", False)
+    dl = d.get("deadline")
+    d["days_left"] = math.floor((dl - now).total_seconds() / 86400) if dl else None
+    d["is_expired"] = bool(dl and dl < now and d.get("status") in PRE_SUBMISSION)
+    return d
+
+
+def readiness_out(row, now: datetime = None) -> dict:
+    d = clean_row(row)
+    now = now or utcnow()
+    due = d.get("due_date")
+    d["is_overdue"] = bool(due and due < now and d.get("status") != "complete")
+    return d
+
 
 def init_db():
-    """Initialize database with schema"""
+    """Initialize database with schema, apply migrations, seed only when empty."""
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -289,82 +494,126 @@ def init_db():
                 timestamp TEXT NOT NULL
             )
         """)
-        # Run migrations for existing databases
-        run_migrations(conn)
-        # Seed if empty
+        conn.commit()
+        # Versioned, additive migrations (backs the DB up first when anything is pending)
+        migrations.run_migrations(conn, DATABASE_PATH)
+        # Seed if empty (fresh installs only — never touches existing rows)
         cursor.execute("SELECT COUNT(*) FROM opportunities")
         if cursor.fetchone()[0] == 0:
             seed_initial_data(cursor)
 
+
 def seed_initial_data(cursor):
-    """Seed database with initial RootRise funding opportunities and readiness items"""
-    now = now_iso()
+    """Seed a fresh install. Dates are relative to install time so the demo data
+    never ships already expired (the v1 seeds were pinned to Jan 2026)."""
+    now = utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    stamp = now_iso()
+
+    def in_days(n):
+        return None if n is None else (now + timedelta(days=n)).isoformat()
+
+    # (name, type, days_to_deadline, status, fit, url, notes, funding, requirements, priority)
     opportunities = [
-        ("Google for Startups MENA", "accelerator", "2026-01-30T00:00:00", "preparing", 80,
+        ("EBRD Star Venture", "accelerator", 45, "researching", 100,
+         "https://www.ebrd.com/starventure", "18-month programme, no equity. Primary target for RootRise.",
+         "No equity, mentorship + network", "Egypt registration, <5 years old, tech focus, B2B", 1),
+        ("Google for Startups Accelerator: MENA", "accelerator", 20, "preparing", 85,
          "https://startup.google.com/programs/accelerator/middle-east-north-africa-turkey/",
-         "Up to $350K GCP credits. URGENT: 7 days until deadline!",
-         "Up to $350K GCP credits", "Seed to Series A, product-market fit, AI/ML focus", None, 1),
-        ("Sanabil 500 MENA (Batch 11)", "accelerator", "2026-03-08T00:00:00", "preparing", 60,
-         "https://500.co/mena", "Seed funding program. $35K program fee required.",
-         "$35K program fee", "Early traction, MENA focus", None, 2),
-        ("EBRD Star Venture (Cohort 5)", "accelerator", "2026-04-15T00:00:00", "researching", 100,
-         "https://www.ebrd.com/starventure", "18-month program, no equity. Primary target for RootRise.",
-         "No equity, mentorship + network", "Egypt registration, <5 years old, tech focus, B2B", None, 1),
+         "Equity-free, AI-first cohort.", "Up to $350K Google Cloud credits",
+         "Seed to Series A, AI/ML focus", 1),
         ("Flat6Labs Cairo", "accelerator", None, "researching", 60,
-         "https://flat6labs.com/cairo", "$10-20K for 10-20% equity. Rolling applications.",
-         "$10-20K for 10-20% equity", "Egyptian founder, MVP required", None, 3),
-        ("AUC Venture Lab", "accelerator", None, "researching", 60,
-         "https://business.aucegypt.edu/research/vlab", "Egypt's first university accelerator. Cohort-based.",
-         "Mentorship + workspace", "Innovation focus, Egyptian connection", None, 3),
-        ("EBRD Innovation Programme", "grant", None, "researching", 80,
-         "https://www.ebrd.com/what-we-do/sectors/advice-small-businesses/star-venture.html",
+         "https://flat6labs.com/", "Rolling applications.",
+         "Seed investment for equity", "Egyptian founder, MVP required", 3),
+        ("EBRD Innovation Grant", "grant", None, "researching", 80,
+         "https://www.ebrd.com/what-we-do/sectors/advice-small-businesses.html",
          "Up to €30K grants. Component-based applications.",
-         "Up to €30K", "EBRD country operations, SME focus", None, 2),
-        ("Berytech ScaleSmart", "accelerator", None, "researching", 60,
-         "https://berytech.org/", "Investor readiness program. Pre-applications open.",
-         "Mentorship + investor access", "MENA startup, growth stage", None, 3),
-        ("Web Summit Qatar", "competition", "2026-01-27T00:00:00", "preparing", 50,
-         "https://qatar.websummit.com/", "Networking opportunity. Jan 26-27, 2026.",
-         "Exposure + networking", "Startup pitch competition entry", None, 2),
+         "Up to €30K", "EBRD country operations, SME focus", 2),
+        ("AWS Activate", "cloud_credits", None, "researching", 75,
+         "https://aws.amazon.com/activate/", "Rolling. Credits plus technical support.",
+         "Up to $100K AWS credits", "Early-stage startup", 2),
+        ("UNICEF Digital Feedback Platform RFP", "rfp", 12, "preparing", 70,
+         "https://www.ungm.org/", "[📋 BD | Auto: Seed] Example BD tender for DEVONEERS.",
+         "Contract", "ICT4D track record, MENA presence", 2),
     ]
-    for opp in opportunities:
+    for (name, type_, days, status, fit, url, notes, funding, reqs, prio) in opportunities:
         cursor.execute("""
             INSERT INTO opportunities
-            (name, type, deadline, status, fit_score, url, notes, funding_amount, requirements, contact_info, priority, is_saved, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-        """, (*opp, now, now))
+            (name, type, deadline, status, fit_score, url, notes, funding_amount, requirements, contact_info,
+             priority, is_saved, category, source, needs_check, url_normalized, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, ?, 'seed', 0, ?, ?, ?)
+        """, (name, type_, in_days(days), status, fit, url, notes, funding, reqs, prio,
+              category_for_type(type_), normalize_url(url) or None, stamp, stamp))
 
+    # (name, category, status, owner, due_in_days, description, priority, dependencies, pct)
     readiness_items = [
-        ("Brand Identity", "documentation", "complete", "Tee", None, "Color system v6.5, 4 themes", 1, None, 100),
-        ("Architecture Docs", "documentation", "complete", "Tee", None, "Complete technical blueprint", 1, None, 100),
-        ("Agent System", "product", "complete", "Tee", None, "11 agents with prompts", 1, None, 100),
-        ("Sector Knowledge", "product", "complete", "Tee", None, "27+ sector packs", 1, None, 100),
+        ("Brand Identity", "documentation", "complete", "Tee", None, "Colour system and themes", 1, None, 100),
+        ("Architecture Docs", "technical", "complete", "Tee", None, "Complete technical blueprint", 1, None, 100),
         ("Team Bios", "team", "complete", "Tee", None, "All founders documented", 2, None, 100),
-        ("Pitch Deck (10 slides)", "pitch", "in_progress", "Tee", "2026-02-15T00:00:00", "Simplified version needed. Target: 10 slides max.", 1, None, 60),
-        ("Financial Projections", "financial", "in_progress", "Rouba", "2026-02-28T00:00:00", "3-year model required", 1, None, 40),
-        ("One-Pager", "pitch", "not_started", None, "2026-02-15T00:00:00", "Single A4 summary for quick investor review", 1, "Pitch Deck", 0),
-        ("Working Demo (MVD)", "product", "not_started", None, "2026-02-15T00:00:00", "Single flow Minimum Viable Demo", 1, None, 0),
-        ("Demo Video (2 min)", "pitch", "not_started", None, "2026-02-28T00:00:00", "Screen recording walkthrough", 2, "Working Demo", 0),
-        ("Customer Testimonials", "market", "not_started", None, "2026-03-31T00:00:00", "Target: 3 testimonials by March", 1, None, 0),
-        ("Case Studies", "market", "not_started", None, "2026-03-31T00:00:00", "Target: 2 detailed case studies by March", 1, "Customer Testimonials", 0),
-        ("Company Registration", "legal", "complete", "Tee", None, "Egyptian commercial registration complete", 2, None, 100),
-        ("Market Size Analysis", "market", "complete", "Rouba", None, "TAM/SAM/SOM for Egyptian SME market", 2, None, 100),
-        ("Competitive Analysis", "market", "in_progress", "Rouba", "2026-02-20T00:00:00", "Detailed competitor landscape", 2, None, 60),
-        ("First 5 Pilots", "operations", "not_started", None, "2026-02-28T00:00:00", "Target: 5 pilot SMEs by end of February", 1, "Working Demo", 0),
-        ("First Revenue", "financial", "not_started", None, "2026-03-31T00:00:00", "Target: $500 revenue by March", 1, "First 5 Pilots", 0),
+        ("Company Registration", "legal", "complete", "Tee", None, "Egyptian commercial registration", 2, None, 100),
+        ("Pitch Deck (10 slides)", "pitch", "in_progress", "Rouba", 14, "Target: 10 slides max.", 1, None, 60),
+        ("Financial Projections", "financial", "in_progress", "Doaa", 21, "3-year model", 1, None, 40),
+        ("One-Pager", "pitch", "not_started", None, 14, "Single A4 summary for investors", 1, "Pitch Deck", 0),
+        ("Working Demo (MVD)", "product", "in_progress", "Tee", 10, "Single-flow minimum viable demo", 1, None, 50),
+        ("Customer Testimonials", "market", "not_started", None, 45, "Target: 3 testimonials", 2, "Working Demo", 0),
+        ("First 5 Pilots", "operations", "not_started", "Alaa", 60, "5 pilot SMEs", 1, "Working Demo", 0),
     ]
-    for item in readiness_items:
+    for (name, cat, status, owner, due, desc, prio, deps, pct) in readiness_items:
         cursor.execute("""
             INSERT INTO readiness_items
             (name, category, status, owner, due_date, description, priority, dependencies, completion_percentage, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (*item, now, now))
+        """, (name, cat, status, owner, in_days(due), desc, prio, deps, pct, stamp, stamp))
+
 
 def log_activity(cursor, action: str, entity_type: str, entity_id: int, details: str = None):
     cursor.execute("""
         INSERT INTO activity_log (action, entity_type, entity_id, details, timestamp)
         VALUES (?, ?, ?, ?, ?)
     """, (action, entity_type, entity_id, details, now_iso()))
+
+
+# ============================================
+# Readiness math (documented in README → "Readiness score")
+# ============================================
+
+READINESS_FORMULA = ("score = Σ(wᵢ·pᵢ) / Σwᵢ, wᵢ = 6 − priority (P1=5 … P5=1), "
+                     "pᵢ = 100 if status = complete else completion_percentage")
+
+
+def effective_progress(item: dict) -> int:
+    return 100 if item.get("status") == "complete" else int(item.get("completion_percentage") or 0)
+
+
+def readiness_score(items: List[dict]) -> float:
+    total_w = sum(6 - int(i.get("priority") or 3) for i in items)
+    if not total_w:
+        return 0.0
+    return sum((6 - int(i.get("priority") or 3)) * effective_progress(i) for i in items) / total_w
+
+
+def reconcile_readiness(status: str, pct: int, status_set: bool, pct_set: bool):
+    """Keep status and completion % consistent in both directions.
+
+    An explicitly sent status wins: complete → 100 %, not_started → 0 %,
+    in_progress caps at 99 %. Otherwise a sent % drives the status:
+    100 → complete, 1–99 → in_progress (unless blocked), 0 from complete → not_started.
+    """
+    if status_set:
+        if status == "complete":
+            pct = 100
+        elif status == "not_started":
+            pct = 0
+        elif status == "in_progress" and pct >= 100:
+            pct = 99
+    elif pct_set:
+        if pct >= 100:
+            status = "complete"
+        elif pct > 0 and status in ("not_started", "complete"):
+            status = "in_progress"
+        elif pct == 0 and status == "complete":
+            status = "not_started"
+    return status, pct
+
 
 # ============================================
 # FastAPI Application
@@ -400,78 +649,120 @@ if os.path.exists(static_dir):
 # Opportunity Endpoints
 # ============================================
 
+ExpiredMode = Literal["include", "exclude", "only"]
+
+
+def _query_opportunities(conn, *, status=None, type=None, category=None, min_fit_score=None,
+                         is_saved=None, needs_check=None, source=None, q=None,
+                         sort_by="deadline", sort_order="asc", expired: str = "include") -> List[dict]:
+    query = "SELECT * FROM opportunities WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if type:
+        query += " AND type = ?"
+        params.append(type)
+    if category:
+        # Rows created before the backfill have NULL category; fall back to the type grouping.
+        types = BD_TYPES if category == "bd" else STARTUP_TYPES + ["other"]
+        query += f" AND (category = ? OR (category IS NULL AND type IN ({','.join('?' * len(types))})))"
+        params.extend([category, *types])
+    if min_fit_score is not None:
+        query += " AND fit_score >= ?"
+        params.append(min_fit_score)
+    if is_saved is not None:
+        query += " AND is_saved = ?"
+        params.append(1 if is_saved else 0)
+    if needs_check is not None:
+        query += " AND needs_check = ?"
+        params.append(1 if needs_check else 0)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    if q:
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        query += (" AND (name LIKE ? ESCAPE '\\' OR notes LIKE ? ESCAPE '\\'"
+                  " OR requirements LIKE ? ESCAPE '\\' OR funding_amount LIKE ? ESCAPE '\\')")
+        params.extend([like] * 4)
+    query += " ORDER BY " + OPPORTUNITY_SORTS[sort_by][sort_order]
+    now = utcnow()
+    rows = [opportunity_out(r, now) for r in conn.execute(query, params).fetchall()]
+    if sort_by == "deadline":
+        # Stored deadlines mix legacy naive strings and +00:00 strings; sort on parsed values.
+        far = datetime.max.replace(tzinfo=timezone.utc)
+        rows.sort(key=lambda o: (o["deadline"] is None, o["deadline"] or far, o["id"]),
+                  reverse=False)
+        if sort_order == "desc":
+            dated = [o for o in rows if o["deadline"]][::-1]
+            rows = dated + [o for o in rows if not o["deadline"]]
+    if expired == "exclude":
+        rows = [o for o in rows if not o["is_expired"]]
+    elif expired == "only":
+        rows = [o for o in rows if o["is_expired"]]
+    return rows
+
+
 @app.get("/api/opportunities", response_model=List[Opportunity])
 async def get_opportunities(
     status: Optional[OpportunityStatus] = None,
     type: Optional[OpportunityType] = None,
     min_fit_score: Optional[int] = Query(None, ge=0, le=100),
-    pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$"),
+    category: Optional[Category] = None,
+    pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$", description="Alias of category (v1.x)"),
     is_saved: Optional[bool] = None,
+    is_starred: Optional[bool] = None,
+    needs_check: Optional[bool] = None,
+    source: Optional[str] = None,
+    q: Optional[str] = Query(None, max_length=200, description="Search name, notes, requirements, funding"),
+    expired: ExpiredMode = Query("include", description="include | exclude | only (default include for v1.x clients)"),
     sort_by: str = Query("deadline", pattern="^(deadline|fit_score|priority|created_at|updated_at|name)$"),
     sort_order: str = Query("asc", pattern="^(asc|desc)$")
 ):
-    """Get all funding opportunities with optional filters including pipeline and saved"""
+    """List opportunities. Every filter is optional; with none, behaves like v1.x (all rows)."""
+    starred = is_starred if is_starred is not None else is_saved
     with db_session() as conn:
-        cursor = conn.cursor()
-        query = "SELECT * FROM opportunities WHERE 1=1"
-        params = []
-        if status:
-            query += " AND status = ?"
-            params.append(status.value)
-        if type:
-            query += " AND type = ?"
-            params.append(type.value)
-        if min_fit_score is not None:
-            query += " AND fit_score >= ?"
-            params.append(min_fit_score)
-        if is_saved is not None:
-            query += " AND is_saved = ?"
-            params.append(1 if is_saved else 0)
-        if pipeline == "startup":
-            placeholders = ','.join('?' * len(STARTUP_TYPES))
-            query += f" AND type IN ({placeholders})"
-            params.extend(STARTUP_TYPES)
-        elif pipeline == "bd":
-            placeholders = ','.join('?' * len(BD_TYPES))
-            query += f" AND type IN ({placeholders})"
-            params.extend(BD_TYPES)
-        query += " ORDER BY " + OPPORTUNITY_SORTS[sort_by][sort_order]
-        cursor.execute(query, params)
-        return [clean_row(row) for row in cursor.fetchall()]
+        return _query_opportunities(
+            conn, status=status.value if status else None, type=type.value if type else None,
+            category=category or pipeline, min_fit_score=min_fit_score, is_saved=starred,
+            needs_check=needs_check, source=source, q=(q or "").strip() or None,
+            sort_by=sort_by, sort_order=sort_order, expired=expired)
+
 
 @app.get("/api/opportunities/counts-by-type")
-async def get_opportunity_counts_by_type(pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$")):
-    """Return opportunity counts grouped by type for filter tabs with dynamic counts."""
+async def get_opportunity_counts_by_type(
+    pipeline: Optional[str] = Query(None, pattern="^(startup|bd)$"),
+    expired: ExpiredMode = Query("include"),
+):
+    """Live counts for filter tabs. `counts` is per type within the pipeline; the
+    other keys let the UI badge every tab (pipelines, starred, needs-check, expired)."""
     with db_session() as conn:
-        cursor = conn.cursor()
-        if pipeline == "startup":
-            placeholders = ','.join('?' * len(STARTUP_TYPES))
-            type_filter = f"WHERE type IN ({placeholders})"
-            params = list(STARTUP_TYPES)
-        elif pipeline == "bd":
-            placeholders = ','.join('?' * len(BD_TYPES))
-            type_filter = f"WHERE type IN ({placeholders})"
-            params = list(BD_TYPES)
-        else:
-            type_filter = ""
-            params = []
+        everything = _query_opportunities(conn)
+    pool = [o for o in everything if not pipeline or o["category"] == pipeline]
+    visible = [o for o in pool if expired == "include"
+               or (expired == "exclude" and not o["is_expired"])
+               or (expired == "only" and o["is_expired"])]
+    counts = {}
+    for o in visible:
+        counts[o["type"]] = counts.get(o["type"], 0) + 1
+    live = [o for o in everything if not o["is_expired"]]
+    return {
+        "counts": dict(sorted(counts.items(), key=lambda kv: -kv[1])),
+        "total": len(visible),
+        "saved_count": sum(o["is_saved"] for o in visible),
+        "starred_count": sum(o["is_saved"] for o in visible),
+        "auth_count": sum(o["needs_check"] for o in visible),
+        "needs_check_count": sum(o["needs_check"] for o in visible),
+        "expired_count": sum(o["is_expired"] for o in pool),
+        "by_category": {
+            "all": len(live),
+            "startup": sum(o["category"] == "startup" for o in live),
+            "bd": sum(o["category"] == "bd" for o in live),
+        },
+        "pipeline": pipeline or "all",
+        "expired": expired,
+    }
 
-        cursor.execute(f"SELECT type, COUNT(*) as count FROM opportunities {type_filter} GROUP BY type ORDER BY count DESC", params)
-        counts = {row[0]: row[1] for row in cursor.fetchall()}
-        cursor.execute(f"SELECT COUNT(*) FROM opportunities {type_filter}", params)
-        total = cursor.fetchone()[0]
-
-        saved_q = f"SELECT COUNT(*) FROM opportunities {type_filter}"
-        saved_q += (" AND is_saved = 1" if type_filter else " WHERE is_saved = 1")
-        cursor.execute(saved_q, params)
-        saved_count = cursor.fetchone()[0]
-
-        auth_q = f"SELECT COUNT(*) FROM opportunities {type_filter}"
-        auth_q += (" AND notes LIKE '%NEEDS CHECK%'" if type_filter else " WHERE notes LIKE '%NEEDS CHECK%'")
-        cursor.execute(auth_q, params)
-        auth_count = cursor.fetchone()[0]
-
-        return {"counts": counts, "total": total, "saved_count": saved_count, "auth_count": auth_count, "pipeline": pipeline or "all"}
 
 @app.put("/api/opportunities/{opp_id}/toggle-save")
 async def toggle_save_opportunity(opp_id: int):
@@ -483,69 +774,97 @@ async def toggle_save_opportunity(opp_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         new_state = 0 if row[0] else 1
-        now = now_iso()
-        cursor.execute("UPDATE opportunities SET is_saved = ?, updated_at = ? WHERE id = ?", (new_state, now, opp_id))
+        cursor.execute("UPDATE opportunities SET is_saved = ?, updated_at = ? WHERE id = ?", (new_state, now_iso(), opp_id))
         log_activity(cursor, "saved" if new_state else "unsaved", "opportunity", opp_id, f"{'Saved' if new_state else 'Unsaved'}: {row[1]}")
-        return {"id": opp_id, "is_saved": bool(new_state), "message": f"Opportunity {'saved' if new_state else 'unsaved'}"}
+        return {"id": opp_id, "is_saved": bool(new_state), "is_starred": bool(new_state),
+                "message": f"Opportunity {'saved' if new_state else 'unsaved'}"}
+
 
 @app.get("/api/opportunities/{opp_id}", response_model=Opportunity)
 async def get_opportunity(opp_id: int):
     with db_session() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,))
-        row = cursor.fetchone()
+        row = conn.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Opportunity not found")
-        return clean_row(row)
+        return opportunity_out(row)
+
+
+def _notes_with_deadline_text(notes: Optional[str], deadline_text: Optional[str]) -> Optional[str]:
+    if not deadline_text:
+        return notes
+    suffix = f"(Deadline as published: {deadline_text})"
+    return f"{notes} {suffix}" if notes else suffix
+
 
 @app.post("/api/opportunities", response_model=Opportunity)
 async def create_opportunity(opp: OpportunityCreate):
     now = now_iso()
+    tags = parse_notes_tags(opp.notes)
+    category = opp.category or tags["category"] or category_for_type(opp.type.value)
+    needs_check = opp.needs_check if opp.needs_check is not None else tags["needs_check"]
+    access_status = opp.access_status or tags["access_status"]
+    source = opp.source or tags["source"] or "manual"
+    notes = _notes_with_deadline_text(opp.notes, opp.deadline_text)
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO opportunities
-            (name, type, deadline, status, fit_score, url, notes, funding_amount, requirements, contact_info, priority, is_saved, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+            (name, type, deadline, status, fit_score, url, notes, funding_amount, requirements, contact_info,
+             priority, is_saved, category, source, needs_check, access_status, url_normalized, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            opp.name, opp.type.value,
-            opp.deadline.isoformat() if opp.deadline else None,
-            opp.status.value, opp.fit_score, opp.url, opp.notes,
+            opp.name, opp.type.value, iso_utc(opp.deadline),
+            opp.status.value, opp.fit_score, opp.url, notes,
             opp.funding_amount, opp.requirements, opp.contact_info, opp.priority,
-            now, now
+            1 if opp.is_saved else 0, category, source, 1 if needs_check else 0, access_status,
+            normalize_url(opp.url) or None, now, now
         ))
         opp_id = cursor.lastrowid
         log_activity(cursor, "created", "opportunity", opp_id, f"Created opportunity: {opp.name}")
-        cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,))
-        return clean_row(cursor.fetchone())
+        return opportunity_out(cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,)).fetchone())
+
+
+OPP_REQUIRED = {"name", "type", "status", "fit_score", "priority", "category"}
+OPP_BOOL = {"needs_check", "is_saved"}
+
 
 @app.put("/api/opportunities/{opp_id}", response_model=Opportunity)
 async def update_opportunity(opp_id: int, opp: OpportunityUpdate):
+    """Partial update. Fields absent from the body are untouched; an explicit
+    `null` clears a nullable field (deadline, url, notes, …)."""
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,))
-        existing = cursor.fetchone()
+        existing = cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Opportunity not found")
-        update_fields = []
-        params = []
         update_data = opp.model_dump(exclude_unset=True)
+        deadline_text = update_data.pop("deadline_text", None)
+        cleared_required = sorted(k for k, v in update_data.items() if v is None and (k in OPP_REQUIRED or k in OPP_BOOL))
+        if cleared_required:
+            raise HTTPException(status_code=422, detail=f"Cannot clear required field(s): {', '.join(cleared_required)}")
+        if deadline_text:
+            update_data["notes"] = _notes_with_deadline_text(update_data.get("notes", existing["notes"]), deadline_text)
+        update_fields, params = [], []
         for field, value in update_data.items():
-            if value is not None:
-                if field == "deadline" and value:
-                    value = value.isoformat()
-                elif hasattr(value, 'value'):
-                    value = value.value
-                update_fields.append(f"{field} = ?")
-                params.append(value)
+            if field == "deadline":
+                value = iso_utc(value)
+            elif hasattr(value, "value"):
+                value = value.value
+            elif field in OPP_BOOL:
+                value = 1 if value else 0
+            update_fields.append(f"{field} = ?")
+            params.append(value)
+            if field == "url":
+                update_fields.append("url_normalized = ?")
+                params.append(normalize_url(value) or None)
         if update_fields:
             update_fields.append("updated_at = ?")
             params.append(now_iso())
             params.append(opp_id)
             cursor.execute(f"UPDATE opportunities SET {', '.join(update_fields)} WHERE id = ?", params)
             log_activity(cursor, "updated", "opportunity", opp_id, f"Updated fields: {', '.join(update_data.keys())}")
-        cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,))
-        return clean_row(cursor.fetchone())
+        return opportunity_out(cursor.execute("SELECT * FROM opportunities WHERE id = ?", (opp_id,)).fetchone())
+
 
 @app.delete("/api/opportunities/{opp_id}")
 async def delete_opportunity(opp_id: int):
@@ -572,7 +891,6 @@ async def get_readiness_items(
     sort_order: str = Query("asc", pattern="^(asc|desc)$")
 ):
     with db_session() as conn:
-        cursor = conn.cursor()
         query = "SELECT * FROM readiness_items WHERE 1=1"
         params = []
         if status:
@@ -585,22 +903,25 @@ async def get_readiness_items(
             query += " AND owner = ?"
             params.append(owner)
         query += " ORDER BY " + READINESS_SORTS[sort_by][sort_order]
-        cursor.execute(query, params)
-        return [clean_row(row) for row in cursor.fetchall()]
+        now = utcnow()
+        return [readiness_out(row, now) for row in conn.execute(query, params).fetchall()]
+
 
 @app.get("/api/readiness-items/{item_id}", response_model=ReadinessItem)
 async def get_readiness_item(item_id: int):
     with db_session() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,))
-        row = cursor.fetchone()
+        row = conn.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Readiness item not found")
-        return clean_row(row)
+        return readiness_out(row)
+
 
 @app.post("/api/readiness-items", response_model=ReadinessItem)
 async def create_readiness_item(item: ReadinessItemCreate):
     now = now_iso()
+    sent = item.model_fields_set
+    status, pct = reconcile_readiness(item.status.value, item.completion_percentage,
+                                      "status" in sent, "completion_percentage" in sent)
     with db_session() as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -608,51 +929,49 @@ async def create_readiness_item(item: ReadinessItemCreate):
             (name, category, status, owner, due_date, description, priority, dependencies, completion_percentage, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            item.name, item.category.value, item.status.value, item.owner,
-            item.due_date.isoformat() if item.due_date else None,
-            item.description, item.priority, item.dependencies, item.completion_percentage,
-            now, now
+            item.name, item.category.value, status, item.owner, iso_utc(item.due_date),
+            item.description, item.priority, item.dependencies, pct, now, now
         ))
         item_id = cursor.lastrowid
         log_activity(cursor, "created", "readiness_item", item_id, f"Created item: {item.name}")
-        cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,))
-        return clean_row(cursor.fetchone())
+        return readiness_out(cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,)).fetchone())
+
+
+READINESS_REQUIRED = {"name", "category", "status", "priority", "completion_percentage"}
+
 
 @app.put("/api/readiness-items/{item_id}", response_model=ReadinessItem)
 async def update_readiness_item(item_id: int, item: ReadinessItemUpdate):
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,))
-        existing = cursor.fetchone()
+        existing = cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Readiness item not found")
-        update_fields = []
-        params = []
         update_data = item.model_dump(exclude_unset=True)
-        for field, value in update_data.items():
-            if value is not None:
-                if field == "due_date" and value:
-                    value = value.isoformat()
-                elif hasattr(value, 'value'):
-                    value = value.value
-                update_fields.append(f"{field} = ?")
-                params.append(value)
-        if "completion_percentage" in update_data:
-            pct = update_data["completion_percentage"]
-            if pct == 100 and "status" not in update_data:
-                update_fields.append("status = ?")
-                params.append("complete")
-            elif pct > 0 and pct < 100 and existing["status"] == "not_started":
-                update_fields.append("status = ?")
-                params.append("in_progress")
-        if update_fields:
-            update_fields.append("updated_at = ?")
-            params.append(now_iso())
-            params.append(item_id)
-            cursor.execute(f"UPDATE readiness_items SET {', '.join(update_fields)} WHERE id = ?", params)
+        cleared_required = sorted(k for k, v in update_data.items() if v is None and k in READINESS_REQUIRED)
+        if cleared_required:
+            raise HTTPException(status_code=422, detail=f"Cannot clear required field(s): {', '.join(cleared_required)}")
+        for k, v in list(update_data.items()):
+            if hasattr(v, "value"):
+                update_data[k] = v.value
+        if "status" in update_data or "completion_percentage" in update_data:
+            status, pct = reconcile_readiness(
+                update_data.get("status", existing["status"]),
+                update_data.get("completion_percentage", existing["completion_percentage"] or 0),
+                "status" in update_data, "completion_percentage" in update_data)
+            if status != existing["status"] or "status" in update_data:
+                update_data["status"] = status
+            if pct != existing["completion_percentage"] or "completion_percentage" in update_data:
+                update_data["completion_percentage"] = pct
+        if "due_date" in update_data:
+            update_data["due_date"] = iso_utc(update_data["due_date"])
+        if update_data:
+            fields = [f"{k} = ?" for k in update_data] + ["updated_at = ?"]
+            params = list(update_data.values()) + [now_iso(), item_id]
+            cursor.execute(f"UPDATE readiness_items SET {', '.join(fields)} WHERE id = ?", params)
             log_activity(cursor, "updated", "readiness_item", item_id, f"Updated fields: {', '.join(update_data.keys())}")
-        cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,))
-        return clean_row(cursor.fetchone())
+        return readiness_out(cursor.execute("SELECT * FROM readiness_items WHERE id = ?", (item_id,)).fetchone())
+
 
 @app.delete("/api/readiness-items/{item_id}")
 async def delete_readiness_item(item_id: int):
@@ -672,58 +991,77 @@ async def delete_readiness_item(item_id: int):
 
 @app.get("/api/dashboard-stats", response_model=DashboardStats)
 async def get_dashboard_stats():
+    now = utcnow()
     with db_session() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM opportunities")
-        total_opps = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM opportunities WHERE status NOT IN ('rejected', 'closed')")
-        active_opps = cursor.fetchone()[0]
-        thirty_days = (utcnow() + timedelta(days=30)).isoformat()
-        cursor.execute("""
-            SELECT COUNT(*) FROM opportunities
-            WHERE deadline IS NOT NULL AND deadline != '' AND deadline <= ? AND deadline >= ?
-            AND status NOT IN ('submitted', 'accepted', 'rejected', 'closed')
-        """, (thirty_days, now_iso()))
-        upcoming_deadlines = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM readiness_items")
-        total_items = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM readiness_items WHERE status = 'complete'")
-        completed_items = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM readiness_items WHERE status = 'in_progress'")
-        in_progress_items = cursor.fetchone()[0]
-        cursor.execute("SELECT SUM(completion_percentage * (6 - priority)) as wc, SUM(6 - priority) as tw FROM readiness_items")
-        row = cursor.fetchone()
-        overall_score = (row[0] / row[1]) if row[1] and row[0] else 0
-        cursor.execute("SELECT status, COUNT(*) as count FROM opportunities GROUP BY status")
-        opps_by_status = {r["status"]: r["count"] for r in cursor.fetchall()}
-        cursor.execute("SELECT type, COUNT(*) as count FROM opportunities GROUP BY type")
-        opps_by_type = {r["type"]: r["count"] for r in cursor.fetchall()}
-        cursor.execute("SELECT category, AVG(completion_percentage) as avg_completion, COUNT(*) as total, SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) as completed FROM readiness_items GROUP BY category")
-        readiness_by_cat = {r["category"]: {"avg_completion": round(r["avg_completion"], 1), "total": r["total"], "completed": r["completed"]} for r in cursor.fetchall()}
-        seven_days = (utcnow() + timedelta(days=7)).isoformat()
-        cursor.execute("SELECT * FROM readiness_items WHERE due_date IS NOT NULL AND due_date != '' AND due_date <= ? AND status != 'complete' ORDER BY due_date ASC LIMIT 10", (seven_days,))
-        urgent_items = [clean_row(r) for r in cursor.fetchall()]
-        cursor.execute("SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT 10")
-        recent_activity = [clean_row(r) for r in cursor.fetchall()]
-        return DashboardStats(
-            total_opportunities=total_opps, active_opportunities=active_opps,
-            upcoming_deadlines=upcoming_deadlines, total_readiness_items=total_items,
-            completed_items=completed_items, in_progress_items=in_progress_items,
-            overall_readiness_score=round(overall_score, 1),
-            opportunities_by_status=opps_by_status, opportunities_by_type=opps_by_type,
-            readiness_by_category=readiness_by_cat, urgent_items=urgent_items, recent_activity=recent_activity
-        )
+        opps = _query_opportunities(conn)
+        items = [readiness_out(r, now) for r in conn.execute("SELECT * FROM readiness_items").fetchall()]
+        recent_activity = [clean_row(r) for r in conn.execute(
+            "SELECT * FROM activity_log ORDER BY id DESC LIMIT 10").fetchall()]
+
+    live = [o for o in opps if not o["is_expired"]]
+    active = [o for o in live if o["status"] not in ("rejected", "closed")]
+    horizon = now + timedelta(days=30)
+    upcoming = sorted(
+        (o for o in active if o["deadline"] and now <= o["deadline"] <= horizon
+         and o["status"] not in ("submitted", "accepted")),
+        key=lambda o: o["deadline"])
+
+    def count_by(rows, key):
+        out = {}
+        for r in rows:
+            out[r[key]] = out.get(r[key], 0) + 1
+        return out
+
+    by_cat = {}
+    for i in items:
+        c = by_cat.setdefault(i["category"], {"progress": [], "total": 0, "completed": 0})
+        c["progress"].append(effective_progress(i))
+        c["total"] += 1
+        c["completed"] += i["status"] == "complete"
+    readiness_by_cat = {k: {"avg_completion": round(sum(v["progress"]) / len(v["progress"]), 1),
+                            "total": v["total"], "completed": v["completed"]} for k, v in by_cat.items()}
+
+    week = now + timedelta(days=7)
+    urgent = sorted((i for i in items if i["due_date"] and i["due_date"] <= week and i["status"] != "complete"),
+                    key=lambda i: i["due_date"])[:10]
+
+    return DashboardStats(
+        total_opportunities=len(opps),
+        active_opportunities=len(active),
+        upcoming_deadlines=len(upcoming),
+        expired_opportunities=sum(o["is_expired"] for o in opps),
+        needs_check_count=sum(o["needs_check"] for o in live),
+        starred_count=sum(o["is_saved"] for o in opps),
+        total_readiness_items=len(items),
+        completed_items=sum(i["status"] == "complete" for i in items),
+        in_progress_items=sum(i["status"] == "in_progress" for i in items),
+        overall_readiness_score=round(readiness_score(items), 1),
+        readiness_formula=READINESS_FORMULA,
+        opportunities_by_status=count_by(opps, "status"),
+        opportunities_by_type=count_by(opps, "type"),
+        opportunities_by_category={"startup": sum(o["category"] == "startup" for o in active),
+                                   "bd": sum(o["category"] == "bd" for o in active)},
+        readiness_by_category=readiness_by_cat,
+        upcoming_opportunities=upcoming[:5],
+        urgent_items=urgent,
+        recent_activity=recent_activity,
+    )
+
 
 @app.get("/api/activity-log", response_model=List[ActivityLog])
 async def get_activity_log(limit: int = Query(20, ge=1, le=100)):
     with db_session() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM activity_log ORDER BY timestamp DESC LIMIT ?", (limit,))
-        return [clean_row(row) for row in cursor.fetchall()]
+        rows = conn.execute("SELECT * FROM activity_log ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [clean_row(row) for row in rows]
+
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "healthy", "version": APP_VERSION, "timestamp": now_iso()}
+    with db_session() as conn:
+        schema_version = migrations.get_version(conn)
+    return {"status": "healthy", "version": APP_VERSION, "schema_version": schema_version,
+            "timestamp": now_iso()}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
