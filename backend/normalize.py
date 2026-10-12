@@ -101,12 +101,22 @@ def title_similarity(a: str, b: str) -> float:
 # Fuzzy matches below this were real, distinct programmes in the live data
 # (e.g. "Techstars Boston" vs "Techstars London" = 0.89).
 FUZZY_DUPLICATE_THRESHOLD = 0.92
+URL_TITLE_MIN_OVERLAP = 0.5
+
+
+def token_overlap(a: str, b: str) -> float:
+    """Jaccard overlap of canonical-name words ("seedstars open calls" vs
+    "seedstars demo days" = 0.2, while SequenceMatcher says 0.72)."""
+    ta, tb = set(canonicalize_name(a).split()), set(canonicalize_name(b).split())
+    return len(ta & tb) / len(ta | tb) if ta and tb else 0.0
 
 
 def is_duplicate(a: dict, b: dict) -> Optional[str]:
     """Return the reason two opportunity dicts are the same programme, or None."""
     ua, ub = normalize_url(a.get("url")), normalize_url(b.get("url"))
-    if ua and ua == ub:
+    # Same URL alone is not enough: scrapers list several programmes on one page
+    # ("Seedstars Open Calls" / "Seedstars Demo Days" differ only by #fragment).
+    if ua and ua == ub and token_overlap(a.get("name", ""), b.get("name", "")) >= URL_TITLE_MIN_OVERLAP:
         return "url"
     ca, cb = canonicalize_name(a.get("name", "")), canonicalize_name(b.get("name", ""))
     if ca and len(ca) > 10 and ca == cb:

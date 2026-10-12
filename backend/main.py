@@ -14,7 +14,7 @@ v1.1 — Feb 13, 2026:
   + Counts by Type endpoint (for filter tabs with dynamic counts)
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
@@ -30,11 +30,11 @@ from contextlib import contextmanager, asynccontextmanager
 
 try:
     from .normalize import (to_utc, iso_utc, normalize_url, parse_notes_tags, category_for_type,
-                            STARTUP_TYPES, BD_TYPES)
+                            is_duplicate, STARTUP_TYPES, BD_TYPES)
     from . import migrations
 except ImportError:  # running as `uvicorn main:app` from backend/
     from normalize import (to_utc, iso_utc, normalize_url, parse_notes_tags, category_for_type,
-                           STARTUP_TYPES, BD_TYPES)
+                           is_duplicate, STARTUP_TYPES, BD_TYPES)
     import migrations
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -796,8 +796,30 @@ def _notes_with_deadline_text(notes: Optional[str], deadline_text: Optional[str]
     return f"{notes} {suffix}" if notes else suffix
 
 
+DEDUP_FILLABLE = ("deadline", "url", "funding_amount", "requirements", "contact_info")
+
+
+def find_duplicate(conn, candidate: dict):
+    """Return (row, reason) for an existing opportunity that is the same programme.
+    URL matches are checked across all rows first, then canonical/fuzzy name."""
+    rows = conn.execute("SELECT * FROM opportunities").fetchall()
+    best = None
+    for r in rows:
+        reason = is_duplicate(candidate, dict(r))
+        if reason == "url":
+            return r, reason
+        if reason and best is None:
+            best = (r, reason)
+    return best or (None, None)
+
+
 @app.post("/api/opportunities", response_model=Opportunity)
-async def create_opportunity(opp: OpportunityCreate):
+async def create_opportunity(opp: OpportunityCreate, response: Response,
+                             allow_duplicate: bool = Query(False, description="Skip server-side dedup")):
+    """Create an opportunity. If it duplicates an existing one (same normalized URL,
+    same canonical name, or ≥0.92 title similarity with the same type) the existing
+    record is returned with 200 and header `X-Duplicate-Of: <id>`; its empty fields
+    are filled from the payload. Any 2xx is success for the Hunter, so it is unaffected."""
     now = now_iso()
     tags = parse_notes_tags(opp.notes)
     category = opp.category or tags["category"] or category_for_type(opp.type.value)
@@ -807,6 +829,26 @@ async def create_opportunity(opp: OpportunityCreate):
     notes = _notes_with_deadline_text(opp.notes, opp.deadline_text)
     with db_session() as conn:
         cursor = conn.cursor()
+        if not allow_duplicate:
+            dup, reason = find_duplicate(conn, {"name": opp.name, "type": opp.type.value, "url": opp.url})
+            if dup is not None:
+                fills = {}
+                for f in DEDUP_FILLABLE:
+                    new_val = iso_utc(opp.deadline) if f == "deadline" else getattr(opp, f)
+                    if new_val and not dup[f]:
+                        fills[f] = new_val
+                if "url" in fills:
+                    fills["url_normalized"] = normalize_url(fills["url"]) or None
+                if fills:
+                    cursor.execute(
+                        f"UPDATE opportunities SET {', '.join(k + ' = ?' for k in fills)}, updated_at = ? WHERE id = ?",
+                        [*fills.values(), now, dup["id"]])
+                log_activity(cursor, "deduplicated", "opportunity", dup["id"],
+                             f"Duplicate of '{dup['name']}' ({reason}) skipped: {opp.name}"
+                             + (f"; filled {', '.join(k for k in fills if k != 'url_normalized')}" if fills else ""))
+                log.info("dedup: %r matches #%d (%s)", opp.name, dup["id"], reason)
+                response.headers["X-Duplicate-Of"] = str(dup["id"])
+                return opportunity_out(cursor.execute("SELECT * FROM opportunities WHERE id = ?", (dup["id"],)).fetchone())
         cursor.execute("""
             INSERT INTO opportunities
             (name, type, deadline, status, fit_score, url, notes, funding_amount, requirements, contact_info,
